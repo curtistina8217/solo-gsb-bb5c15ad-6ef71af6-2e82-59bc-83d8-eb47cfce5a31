@@ -10,7 +10,12 @@ from .schemas import (
     matrix_to_nested,
 )
 from .joint import JointTrialResult, MutexGroup, joint_trial
-from .repository import insert_reservation, load_slot_book
+from .repository import (
+    cancel_reservation,
+    insert_reservation,
+    load_reservation,
+    load_slot_book,
+)
 from .separation import (
     Capacity,
     ClosureConflict,
@@ -434,16 +439,8 @@ def run_book_reservation(
     matrix = book["matrix"]
     windows = book["windows"]
     capacity = book["capacity"]
-    schedule = book["flights"] + [
-        Flight(
-            flight_no=r.flight_no,
-            scheduled_off=r.assigned_off,
-            wake=r.wake,
-            runway=book["runway"],
-        )
-        for r in active
-    ]
     # 防御性复检：插入算法以既有计划可行为前提（见 SlotBookStateError）。
+    schedule = sort_flights(_book_schedule(book))
     if (
         find_violations(schedule, matrix)
         or find_closure_conflicts(schedule, windows)
@@ -484,6 +481,188 @@ def run_book_reservation(
         position=result.position,
     )
     return reservation, book
+
+
+class ReservationNotFoundError(Exception):
+    """预约不存在（属于存在的预约簿，API 层转为 404）。"""
+
+
+class CancellationConflictError(Exception):
+    """取消后剩余计划违反冻结约束（API 层转为 409）。
+
+    删除中间预约会让原本不相邻的航班成为相邻对：簿内自定义矩阵若不满足
+    三角不等式（如只定义 J→L 为 300 秒、其余为 0），该新相邻对就可能
+    违反尾流间隔。``detail`` 为可直接作为 409 响应体的结构化明细，列出
+    冲突前后航班、要求与实际间隔；此时预约状态与取消时间保持不变。
+    """
+
+    def __init__(self, detail: dict) -> None:
+        super().__init__(detail["reason"])
+        self.detail = detail
+
+
+def _utc_z(moment) -> str:
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def _book_schedule(book: dict, *, exclude_reservation_id: str | None = None):
+    """固定计划 + 有效预约合成的航班序列（调用方再做稳定排序）。"""
+    active = [
+        r
+        for r in book["reservations"]
+        if r.status == "active" and r.reservation_id != exclude_reservation_id
+    ]
+    return list(book["flights"]) + [
+        Flight(
+            flight_no=r.flight_no,
+            scheduled_off=r.assigned_off,
+            wake=r.wake,
+            runway=book["runway"],
+        )
+        for r in active
+    ]
+
+
+def run_cancel_reservation(conn, book_id: str, reservation_id: str) -> Reservation:
+    """校验删除目标预约后合成计划仍满足冻结约束，可行才取消。
+
+    必须在 ``BEGIN IMMEDIATE`` 写事务内调用，与预约共用同一把写锁：读取
+    簿状态、约束校验与取消写入是同一原子单元。两个各自可行但合并不可行
+    的并发取消因此被串行化——后到事务基于前者已提交的状态重新校验，
+    至多一个成功。
+
+    - 预约簿不存在抛 :class:`SlotBookNotFoundError`（404）；
+    - 预约不存在（含固定计划航班，它们没有预约 ID）抛
+      :class:`ReservationNotFoundError`（404）；
+    - 预约已取消：幂等，原样返回（不重复写取消时间）；
+    - 删除后固定计划 + 其余有效预约的稳定排序序列违反尾流间隔、落入
+      关闭窗口或超出滚动容量，抛 :class:`CancellationConflictError`
+      （409，明细列出冲突前后航班、要求与实际间隔），不写入任何内容。
+
+    可行时将预约置为 ``cancelled`` 并记录取消时间，其他航班时刻一律
+    不移动。
+    """
+    book = load_slot_book(conn, book_id)
+    if book is None:
+        raise SlotBookNotFoundError(f"预约簿不存在: {book_id}")
+    reservation = load_reservation(conn, book_id, reservation_id)
+    if reservation is None:
+        raise ReservationNotFoundError(f"预约不存在: {reservation_id}")
+    if reservation.status != "active":
+        # 幂等：重复取消直接成功，预约状态与取消时间均不变。
+        return reservation
+
+    remaining = sort_flights(
+        _book_schedule(book, exclude_reservation_id=reservation_id)
+    )
+    matrix = book["matrix"]
+    violations = find_violations(remaining, matrix)
+    conflicts = find_closure_conflicts(remaining, book["windows"])
+    capacity_violations = find_capacity_violations(remaining, book["capacity"])
+    if violations or conflicts or capacity_violations:
+        raise CancellationConflictError(
+            _cancellation_conflict_detail(
+                reservation=reservation,
+                violations=violations,
+                closure_conflicts=conflicts,
+                capacity_violations=capacity_violations,
+            )
+        )
+
+    cancel_reservation(conn, reservation_id)
+    return reservation
+
+
+def _cancellation_conflict_detail(
+    *,
+    reservation: Reservation,
+    violations: list[Violation],
+    closure_conflicts: list[ClosureConflict],
+    capacity_violations: list,
+) -> dict:
+    """409 明细：取消目标、冲突前后航班、要求与实际间隔。
+
+    取消只会移除航班，关闭窗口与滚动容量约束不可能因此被破坏（命中
+    窗口或容量窗口的航班只可能变少），冲突实际只会是新相邻对的尾流
+    违规；后两类仍一并校验并可在明细中给出，保持三类约束的完整复检。
+    """
+    wake_conflicts = [
+        {
+            "type": "wake",
+            "leader": v.leader_no,
+            "follower": v.follower_no,
+            "leader_wake": v.leader_wake,
+            "follower_wake": v.follower_wake,
+            "leader_scheduled_off": _utc_z(v.leader_time),
+            "follower_scheduled_off": _utc_z(v.follower_time),
+            "leader_position": v.leader_position,
+            "follower_position": v.follower_position,
+            "required_seconds": v.required_seconds,
+            "actual_seconds": v.actual_seconds,
+            "shortfall_seconds": v.shortfall_seconds,
+        }
+        for v in violations
+    ]
+    closure_payload = [
+        {
+            "type": "closure",
+            "flight_no": c.flight_no,
+            "wake": c.wake,
+            "scheduled_off": _utc_z(c.scheduled_off),
+            "position": c.position,
+            "window_index": c.window_index,
+            "window_start": _utc_z(c.window_start),
+            "window_end": _utc_z(c.window_end),
+        }
+        for c in closure_conflicts
+    ]
+    capacity_payload = [
+        {
+            "type": "capacity",
+            "flight_no": cv.flight_no,
+            "wake": cv.wake,
+            "scheduled_off": _utc_z(cv.scheduled_off),
+            "position": cv.position,
+            "window_seconds": cv.window_seconds,
+            "max_departures": cv.max_departures,
+            "anchor_flight_no": cv.anchor_flight_no,
+            "anchor_position": cv.anchor_position,
+            "window_start": _utc_z(cv.anchor_off),
+            "window_end": _utc_z(cv.window_end),
+            "departures_in_window": cv.departures_in_window,
+            "earliest_compliant_off": _utc_z(cv.earliest_compliant_off),
+        }
+        for cv in capacity_violations
+    ]
+    conflicts = wake_conflicts + closure_payload + capacity_payload
+    if wake_conflicts:
+        first = wake_conflicts[0]
+        reason = (
+            "取消预约将使剩余航班违反尾流间隔约束，已拒绝："
+            f"预约 {reservation.flight_no}（{reservation.reservation_id}）"
+            f"原位于 {_utc_z(reservation.assigned_off)}，删除后 "
+            f"{first['leader']}（{first['leader_wake']}）与 "
+            f"{first['follower']}（{first['follower_wake']}）成为相邻航班，"
+            f"要求间隔 {first['required_seconds']} 秒，"
+            f"实际仅 {first['actual_seconds']} 秒；"
+            "其他航班时刻不会被移动。预约状态与取消时间均不变。"
+        )
+    else:
+        reason = (
+            "取消预约将使剩余航班违反预约簿冻结约束，已拒绝；"
+            "其他航班时刻不会被移动。预约状态与取消时间均不变。"
+        )
+    return {
+        "reason": reason,
+        "reservation_id": reservation.reservation_id,
+        "flight_no": reservation.flight_no,
+        "assigned_off": _utc_z(reservation.assigned_off),
+        "conflict_count": len(conflicts),
+        "wake_conflict_count": len(wake_conflicts),
+        "closure_conflict_count": len(closure_payload),
+        "capacity_conflict_count": len(capacity_payload),
+        "conflicts": conflicts,
+    }
 
 
 def _groups_from_request(req: JointTrialRequest) -> list[MutexGroup]:

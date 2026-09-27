@@ -10,14 +10,11 @@ from fastapi.responses import JSONResponse
 
 from .database import get_booking_db, get_db, init_db
 from .repository import (
-    cancel_reservation,
     load_batch,
     load_conflict_group_inputs,
-    load_reservation,
     load_slot_book,
     save_batch,
     save_slot_book,
-    slot_book_exists,
 )
 from .schemas import (
     BaselineMetricsOut,
@@ -62,14 +59,17 @@ from .schemas import (
 )
 from .separation import ClosureWindow, Reservation, build_conflict_groups, delay_stats
 from .service import (
+    CancellationConflictError,
     DuplicateFlightNoError,
     NoSlotAvailableError,
+    ReservationNotFoundError,
     SlotBaselineError,
     SlotBookNotFoundError,
     SlotBookStateError,
     nested_matrix,
     run_best_adjacent_swap,
     run_book_reservation,
+    run_cancel_reservation,
     run_create_slot_book,
     run_joint_trial,
     run_slot_insert,
@@ -115,10 +115,14 @@ app = FastAPI(
         "预约在固定计划与有效预约的合成计划上复用插入算法求最早可行时隙"
         "（读取、求解、写入在同一事务内，后到请求依据已提交预约重新计算），"
         "成功返回预约 ID 与 UTC 时刻，无空档或同簿航班号重复返回 409；"
-        "支持查询预约簿与取消预约（取消立即释放时隙，固定计划不可取消，"
-        "重复取消返回 204，未知簿或预约返回 404）。"
+        "支持查询预约簿与取消预约：取消先按冻结的尾流/关闭窗口/容量"
+        "约束校验删除目标后的固定计划与有效预约（按时刻、航班号重新"
+        "排序），不可行返回 409 且预约不变，可行才取消（其他航班不"
+        "移动）；固定计划不可取消，重复取消返回 204，未知簿或预约"
+        "返回 404；读取、校验、写入与预约共用 BEGIN IMMEDIATE 写"
+        "事务串行化。"
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -1023,22 +1027,36 @@ def book_reservation(
 def cancel_reservation_endpoint(
     book_id: str,
     reservation_id: str,
-    db: sqlite3.Connection = Depends(get_db),
+    db: sqlite3.Connection = Depends(get_booking_db),
 ) -> Response:
-    """取消预约：立即释放所占时隙（后续预约可占用该空档）。
+    """取消预约：按冻结约束校验删除目标后的合成计划，可行才释放时隙。
 
-    幂等：取消已取消的预约同样返回 204。固定计划中的航班不是预约，
-    无法通过本接口取消。预约簿或预约不存在返回 404。
+    删除中间预约会让原本不相邻的航班成为相邻航班：簿内自定义间隔矩阵
+    若不满足三角不等式（例如只定义 J→L 为 300 秒、其余为 0），新的
+    相邻对就可能违反尾流间隔。因此在与预约相同的 **``BEGIN
+    IMMEDIATE`` 写事务**内读取簿状态，按 (时刻, 航班号) 重新排序
+    **固定计划 + 其余有效预约**，逐一复检相邻尾流间隔、关闭窗口与
+    滚动容量：
+
+    - 不可行返回 **409**，响应体列出冲突前后航班、要求与实际间隔，
+      预约状态与取消时间均不变，其他航班也不移动；
+    - 可行才将预约置为 ``cancelled``、记录取消时间并返回 **204**
+      （无响应体），其他航班时刻一律不变；
+    - **幂等**：取消已取消的预约同样返回 204（不重复写取消时间）；
+    - 固定计划中的航班不是预约、没有预约 ID，按未知预约处理返回 404；
+      预约簿或预约不存在返回 404。
+
+    与预约共用写事务保证两个各自可行但合并不可行的并发取消至多一个
+    成功：后到事务等待前者提交后依据最新状态重新校验。
     """
-    if not slot_book_exists(db, book_id):
-        raise HTTPException(status_code=404, detail=f"预约簿不存在: {book_id}")
-    reservation = load_reservation(db, book_id, reservation_id)
-    if reservation is None:
-        raise HTTPException(
-            status_code=404, detail=f"预约不存在: {reservation_id}"
-        )
-    if reservation.status == "active":
-        cancel_reservation(db, reservation_id)
+    try:
+        run_cancel_reservation(db, book_id, reservation_id)
+    except SlotBookNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ReservationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CancellationConflictError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
     return Response(status_code=204)
 
 
