@@ -360,6 +360,132 @@ def test_frozen_plan_flights_are_not_cancellable(client):
     assert [f["flight_no"] for f in again["flights"]] == ["CA1", "CA2"]
 
 
+def test_cancel_middle_reservation_wake_gap_returns_409(client):
+    """取消中间预约会使新的相邻对违反尾流间隔：拒绝取消并列出冲突明细。
+
+    固定 J 机 00:00，预约 M 机 00:01、L 机 00:02，自定义 J->L=300 秒、
+    其他组合为 0：取消 M 后 J->L 只剩 120 秒，不能直接成功。
+    """
+    body = {
+        "runway": {
+            "runway": "36L",
+            "flights": [
+                {"flight_no": "J1", "scheduled_off": "2026-09-18T00:00:00Z", "wake": "J"},
+            ],
+        },
+        "matrix": [{"leader": "J", "follower": "L", "seconds": 300}],
+    }
+    book_id = _make_book(client, **body)
+    url = f"/api/v1/slot-books/{book_id}/reservations"
+    m = client.post(
+        url,
+        json=_res_body(
+            "M1",
+            earliest="2026-09-18T00:01:00Z",
+            latest="2026-09-18T00:01:00Z",
+            wake="M",
+        ),
+    ).json()
+    l = client.post(
+        url,
+        json=_res_body(
+            "L1",
+            earliest="2026-09-18T00:02:00Z",
+            latest="2026-09-18T00:02:00Z",
+            wake="L",
+        ),
+    ).json()
+    assert m["assigned_off"] == "2026-09-18T00:01:00Z"
+    assert l["assigned_off"] == "2026-09-18T00:02:00Z"
+
+    # cancel the middle M flight: J->L would drop to 120s < 300s -> 409
+    r = client.delete(f"{url}/{m['reservation_id']}")
+    assert r.status_code == 409
+    data = r.json()
+    assert "无法取消" in data["detail"]
+    assert "J1" in data["detail"] and "L1" in data["detail"]
+    assert "300" in data["detail"] and "120" in data["detail"]
+    assert len(data["conflicts"]) == 1
+    conflict = data["conflicts"][0]
+    assert conflict["leader"] == "J1"
+    assert conflict["follower"] == "L1"
+    assert conflict["leader_wake"] == "J"
+    assert conflict["follower_wake"] == "L"
+    assert conflict["leader_scheduled_off"] == "2026-09-18T00:00:00Z"
+    assert conflict["follower_scheduled_off"] == "2026-09-18T00:02:00Z"
+    assert conflict["required_seconds"] == 300
+    assert conflict["actual_seconds"] == 120
+    assert conflict["shortfall_seconds"] == 180
+    assert conflict["leader_position"] == 1
+    assert conflict["follower_position"] == 2
+
+    # 预约状态及取消时间均不变，时隙未释放
+    book = client.get(f"/api/v1/slot-books/{book_id}").json()
+    by_id = {x["reservation_id"]: x for x in book["reservations"]}
+    assert book["active_reservations"] == 2
+    assert by_id[m["reservation_id"]]["status"] == "active"
+    assert by_id[m["reservation_id"]]["cancelled_at"] is None
+    assert by_id[l["reservation_id"]]["status"] == "active"
+
+    # 簿状态未被破坏：后续预约不再被 409 拒绝
+    after = client.post(url, json=_res_body("M2", earliest="2026-09-18T00:03:00Z",
+                                            latest="2026-09-18T00:03:00Z", wake="M"))
+    assert after.status_code == 200, after.text
+
+    # 取消 L 机后剩余 J->M 无最小间隔，M 机随之可以取消（其他航班不移动）
+    assert client.delete(f"{url}/{l['reservation_id']}").status_code == 204
+    assert client.delete(f"{url}/{m['reservation_id']}").status_code == 204
+    final = client.get(f"/api/v1/slot-books/{book_id}").json()
+    assert final["active_reservations"] == 1  # 之后预约的 M2 仍有效
+    assert [f["flight_no"] for f in final["flights"]] == ["J1"]
+
+
+def test_cancel_middle_reservation_feasible_when_gap_holds(client):
+    """取消中间预约后新相邻对仍满足间隔时正常取消，其他航班时刻不变。"""
+    # J->L=180 秒，其余组合为 0：J 00:00、M 00:01、L 00:05，取消 M 后
+    # J->L=300 秒 >= 180 秒，取消可行。
+    body = {
+        "runway": {
+            "runway": "36L",
+            "flights": [
+                {"flight_no": "J1", "scheduled_off": "2026-09-18T00:00:00Z", "wake": "J"},
+            ],
+        },
+        "matrix": [{"leader": "J", "follower": "L", "seconds": 180}],
+    }
+    book_id = _make_book(client, **body)
+    url = f"/api/v1/slot-books/{book_id}/reservations"
+    m = client.post(
+        url,
+        json=_res_body(
+            "M1",
+            earliest="2026-09-18T00:01:00Z",
+            latest="2026-09-18T00:01:00Z",
+            wake="M",
+        ),
+    ).json()
+    l = client.post(
+        url,
+        json=_res_body(
+            "L1",
+            earliest="2026-09-18T00:05:00Z",
+            latest="2026-09-18T00:05:00Z",
+            wake="L",
+        ),
+    ).json()
+
+    r = client.delete(f"{url}/{m['reservation_id']}")
+    assert r.status_code == 204
+    assert not r.content
+    book = client.get(f"/api/v1/slot-books/{book_id}").json()
+    by_id = {x["reservation_id"]: x for x in book["reservations"]}
+    assert by_id[m["reservation_id"]]["status"] == "cancelled"
+    assert by_id[m["reservation_id"]]["cancelled_at"] is not None
+    # 其他航班时刻不变
+    assert by_id[l["reservation_id"]]["assigned_off"] == "2026-09-18T00:05:00Z"
+    assert by_id[l["reservation_id"]]["status"] == "active"
+
+
 # ---------- concurrency ----------
 
 
@@ -431,3 +557,147 @@ def test_concurrent_duplicate_flight_no_exactly_one_wins(client):
     assert codes == [200, 409, 409, 409]
     book = client.get(f"/api/v1/slot-books/{book_id}").json()
     assert book["active_reservations"] == 1
+
+
+def test_concurrent_cancels_jointly_infeasible_at_most_one_wins(client):
+    """两个各自可行但合并不可行的并发取消：至多一个成功（204），另一个 409。
+
+    固定 J@00:00，预约 M@00:01、M@00:02、L@00:03，自定义 J->L=300 秒、
+    其他组合为 0：单独取消任一 M 后 J 与 L 之间仍隔着另一 M（可行），
+    两个 M 同时取消则 J->L 只剩 180 秒（不可行）。写事务串行化后，
+    后到取消依据已提交状态重新校验，必然被 409 拒绝。
+    """
+    body = {
+        "runway": {
+            "runway": "36L",
+            "flights": [
+                {"flight_no": "J1", "scheduled_off": "2026-09-18T00:00:00Z", "wake": "J"},
+            ],
+        },
+        "matrix": [{"leader": "J", "follower": "L", "seconds": 300}],
+    }
+    book_id = _make_book(client, **body)
+    url = f"/api/v1/slot-books/{book_id}/reservations"
+    b = client.post(
+        url,
+        json=_res_body("M1", earliest="2026-09-18T00:01:00Z",
+                       latest="2026-09-18T00:01:00Z", wake="M"),
+    ).json()
+    c = client.post(
+        url,
+        json=_res_body("M2", earliest="2026-09-18T00:02:00Z",
+                       latest="2026-09-18T00:02:00Z", wake="M"),
+    ).json()
+    d = client.post(
+        url,
+        json=_res_body("L1", earliest="2026-09-18T00:03:00Z",
+                       latest="2026-09-18T00:03:00Z", wake="L"),
+    ).json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(
+            pool.map(
+                lambda rid: client.delete(f"{url}/{rid}"),
+                [b["reservation_id"], c["reservation_id"]],
+            )
+        )
+
+    assert sorted(r.status_code for r in responses) == [204, 409]
+    conflicted = next(r for r in responses if r.status_code == 409).json()
+    assert conflicted["conflicts"][0]["leader"] == "J1"
+    assert conflicted["conflicts"][0]["follower"] == "L1"
+    assert conflicted["conflicts"][0]["required_seconds"] == 300
+    assert conflicted["conflicts"][0]["actual_seconds"] == 180
+
+    # exactly one of the two middle reservations was cancelled
+    book = client.get(f"/api/v1/slot-books/{book_id}").json()
+    by_id = {x["reservation_id"]: x for x in book["reservations"]}
+    middle_statuses = sorted(
+        by_id[r["reservation_id"]]["status"] for r in (b, c)
+    )
+    assert middle_statuses == ["active", "cancelled"]
+    assert by_id[d["reservation_id"]]["status"] == "active"
+    # the surviving state is feasible: a fresh booking is not rejected
+    again = client.post(
+        url,
+        json=_res_body("M3", earliest="2026-09-18T00:04:00Z",
+                       latest="2026-09-18T00:04:00Z", wake="M"),
+    )
+    assert again.status_code == 200, again.text
+
+
+def test_concurrent_cancel_and_booking_share_serialization(client):
+    """取消与新预约共用 BEGIN IMMEDIATE 写事务：交错完成后簿状态始终可行。
+
+    固定 J@00:00、已预约 M@00:01 与 L@00:02（J->L=300）。并发执行：
+    取消 M 与 在 00:01:30 插入新 M。若取消先提交则其读到 J、M、L 相邻
+    而被 409；若插入先提交则取消后仍有新 M 隔开 J、L，取消 204。
+    两种交错下预约都成功，且最终固定计划 + 有效预约满足冻结矩阵。
+    """
+    import threading
+
+    body = {
+        "runway": {
+            "runway": "36L",
+            "flights": [
+                {"flight_no": "J1", "scheduled_off": "2026-09-18T00:00:00Z", "wake": "J"},
+            ],
+        },
+        "matrix": [{"leader": "J", "follower": "L", "seconds": 300}],
+    }
+    book_id = _make_book(client, **body)
+    url = f"/api/v1/slot-books/{book_id}/reservations"
+    m = client.post(
+        url,
+        json=_res_body("M1", earliest="2026-09-18T00:01:00Z",
+                       latest="2026-09-18T00:01:00Z", wake="M"),
+    ).json()
+    client.post(
+        url,
+        json=_res_body("L1", earliest="2026-09-18T00:02:00Z",
+                       latest="2026-09-18T00:02:00Z", wake="L"),
+    )
+
+    barrier = threading.Barrier(2)
+
+    def cancel():
+        barrier.wait()
+        return client.delete(f"{url}/{m['reservation_id']}")
+
+    def book():
+        barrier.wait()
+        return client.post(
+            url,
+            json=_res_body("M9", earliest="2026-09-18T00:01:30Z",
+                           latest="2026-09-18T00:01:30Z", wake="M"),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cancel_future = pool.submit(cancel)
+        book_future = pool.submit(book)
+        cancel_r = cancel_future.result()
+        book_r = book_future.result()
+
+    assert book_r.status_code == 200, book_r.text
+    assert cancel_r.status_code in (204, 409)
+
+    # invariant: the frozen plan plus active reservations still satisfies
+    # every frozen adjacent gap (here only J->L = 300s matters)
+    book = client.get(f"/api/v1/slot-books/{book_id}").json()
+    ordered = sorted(
+        [(f["flight_no"], f["wake"], _epoch(f["scheduled_off"])) for f in book["flights"]]
+        + [
+            (r["flight_no"], r["wake"], _epoch(r["assigned_off"]))
+            for r in book["reservations"]
+            if r["status"] == "active"
+        ],
+        key=lambda item: (item[2], item[0]),
+    )
+    required = {("J", "L"): 300}
+    for (_, wake_a, t_a), (_, wake_b, t_b) in zip(ordered, ordered[1:]):
+        assert t_b - t_a >= required.get((wake_a, wake_b), 0)
+
+
+def _epoch(iso: str) -> int:
+    from datetime import datetime
+    return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())

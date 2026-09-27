@@ -10,7 +10,7 @@ from .schemas import (
     matrix_to_nested,
 )
 from .joint import JointTrialResult, MutexGroup, joint_trial
-from .repository import insert_reservation, load_slot_book
+from .repository import cancel_reservation, insert_reservation, load_slot_book
 from .separation import (
     Capacity,
     ClosureConflict,
@@ -219,6 +219,7 @@ def _baseline_error_message(
     capacity_violations: list,
     *,
     action: str = "评估插入",
+    prefix: str = "现有计划违反约束",
 ) -> str:
     parts: list[str] = []
     if violations:
@@ -244,7 +245,7 @@ def _baseline_error_message(
             f"[{first.anchor_off.isoformat()}, {first.window_end.isoformat()}) 内"
             f"超出 {first.window_seconds} 秒/{first.max_departures} 架限制）"
         )
-    return f"现有计划违反约束，无法{action}：" + "；".join(parts)
+    return f"{prefix}，无法{action}：" + "；".join(parts)
 
 
 def run_slot_insert(
@@ -332,8 +333,9 @@ class SlotBookStateError(Exception):
     """固定计划与有效预约的合成计划自身不可行（API 层转为 409）。
 
     正常流程下不会触发：固定计划建簿时已校验可行，每条预约提交时都保证
-    合成序列满足全部约束，取消只会放宽约束；仅当簿内自定义间隔矩阵不
-    满足三角不等式、取消中间预约后可能出现相邻对缺口。
+    合成序列满足全部约束，取消预约前也会校验删除目标后的剩余计划
+    （不可行则拒绝取消，见 :class:`CancelInfeasibleError`），因此合成
+    计划始终保持可行；run_book_reservation 中的复检仅为防御性断言。
     """
 
 
@@ -450,8 +452,7 @@ def run_book_reservation(
         or find_capacity_violations(schedule, capacity)
     ):
         raise SlotBookStateError(
-            "预约簿当前合成计划违反约束，无法继续预约；"
-            "请检查自定义间隔矩阵在取消预约后是否仍保证相邻间隔"
+            "预约簿当前合成计划违反冻结约束，无法继续预约"
         )
 
     result = find_insert_slot(
@@ -484,6 +485,100 @@ def run_book_reservation(
         position=result.position,
     )
     return reservation, book
+
+
+class ReservationNotFoundError(Exception):
+    """预约不存在（API 层转为 404）。"""
+
+
+class CancelInfeasibleError(Exception):
+    """取消该预约后，剩余固定计划与有效预约违反冻结约束（API 层转为 409）。
+
+    删除中间预约会把原本不相邻的两架航班拼为相邻对，自定义间隔矩阵不
+    满足三角不等式时该新相邻对可能不满足尾流间隔（如 J→L 要求 300 秒，
+    中间的 M 机被取消后 J→L 只剩 120 秒）。``violations`` 携带删除目标
+    后合成序列上的全部尾流违规（冲突前后航班、要求与实际间隔），关闭
+    窗口冲突与滚动容量超限一并带出（正常流程下取消只移除航班，不会
+    新增这两类冲突，仅为防御性完整）。抛出时不写入任何记录，预约状态
+    与取消时间保持原样。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        violations: list[Violation],
+        conflicts: list[ClosureConflict],
+        capacity_violations: list,
+    ) -> None:
+        super().__init__(message)
+        self.violations = violations
+        self.conflicts = conflicts
+        self.capacity_violations = capacity_violations
+
+
+def run_cancel_reservation(
+    conn,
+    book_id: str,
+    reservation_id: str,
+) -> Reservation:
+    """取消预约：仅当删除目标后的剩余计划仍满足冻结约束时才取消。
+
+    必须在 ``BEGIN IMMEDIATE`` 事务内调用（与新预约相同）：读取簿状态、
+    校验删除后的合成计划与写入取消标记为同一原子单元。并发取消因此被
+    串行化——后到请求等待前一事务提交后依据最新已提交状态重新校验，
+    两个各自可行但合并不可行的取消至多一个成功。取消只把预约标记为
+    cancelled 并立即释放时隙，不移动任何其他航班的时刻。
+
+    依次可能抛出：:class:`SlotBookNotFoundError`（404，簿不存在）、
+    :class:`ReservationNotFoundError`（404，预约不存在）、
+    :class:`CancelInfeasibleError`（409，删除目标后不可行；不写入任何
+    记录，预约状态与取消时间不变）。已取消的预约重复取消是幂等空操作，
+    直接返回该预约（API 层仍返回 204）。
+    """
+    book = load_slot_book(conn, book_id)
+    if book is None:
+        raise SlotBookNotFoundError(f"预约簿不存在: {book_id}")
+    reservation = next(
+        (r for r in book["reservations"] if r.reservation_id == reservation_id),
+        None,
+    )
+    if reservation is None:
+        raise ReservationNotFoundError(f"预约不存在: {reservation_id}")
+    if reservation.status == "cancelled":
+        # 幂等：重复取消无需重新校验，直接视为成功（仍返回 204）。
+        return reservation
+
+    # 删除目标后的合成计划：固定计划 + 除目标外的全部有效预约，仍按
+    # （离场时刻, 航班号）稳定排序后逐对校验。
+    remaining = book["flights"] + [
+        Flight(
+            flight_no=r.flight_no,
+            scheduled_off=r.assigned_off,
+            wake=r.wake,
+            runway=book["runway"],
+        )
+        for r in book["reservations"]
+        if r.status == "active" and r.reservation_id != reservation_id
+    ]
+    violations = find_violations(remaining, book["matrix"])
+    conflicts = find_closure_conflicts(remaining, book["windows"])
+    capacity_violations = find_capacity_violations(remaining, book["capacity"])
+    if violations or conflicts or capacity_violations:
+        raise CancelInfeasibleError(
+            _baseline_error_message(
+                violations,
+                conflicts,
+                capacity_violations,
+                action="取消该预约",
+                prefix="取消后剩余的固定计划与有效预约违反冻结约束",
+            ),
+            violations,
+            conflicts,
+            capacity_violations,
+        )
+
+    cancel_reservation(conn, reservation_id)
+    return reservation
 
 
 def _groups_from_request(req: JointTrialRequest) -> list[MutexGroup]:

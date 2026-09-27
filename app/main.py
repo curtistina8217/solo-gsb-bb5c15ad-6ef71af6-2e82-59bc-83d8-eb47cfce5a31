@@ -10,14 +10,11 @@ from fastapi.responses import JSONResponse
 
 from .database import get_booking_db, get_db, init_db
 from .repository import (
-    cancel_reservation,
     load_batch,
     load_conflict_group_inputs,
-    load_reservation,
     load_slot_book,
     save_batch,
     save_slot_book,
-    slot_book_exists,
 )
 from .schemas import (
     BaselineMetricsOut,
@@ -62,14 +59,17 @@ from .schemas import (
 )
 from .separation import ClosureWindow, Reservation, build_conflict_groups, delay_stats
 from .service import (
+    CancelInfeasibleError,
     DuplicateFlightNoError,
     NoSlotAvailableError,
+    ReservationNotFoundError,
     SlotBaselineError,
     SlotBookNotFoundError,
     SlotBookStateError,
     nested_matrix,
     run_best_adjacent_swap,
     run_book_reservation,
+    run_cancel_reservation,
     run_create_slot_book,
     run_joint_trial,
     run_slot_insert,
@@ -115,10 +115,15 @@ app = FastAPI(
         "预约在固定计划与有效预约的合成计划上复用插入算法求最早可行时隙"
         "（读取、求解、写入在同一事务内，后到请求依据已提交预约重新计算），"
         "成功返回预约 ID 与 UTC 时刻，无空档或同簿航班号重复返回 409；"
-        "支持查询预约簿与取消预约（取消立即释放时隙，固定计划不可取消，"
-        "重复取消返回 204，未知簿或预约返回 404）。"
+        "取消预约前按冻结约束校验删除目标后的固定计划与有效预约（仍按"
+        "时刻、航班号排序）：不可行返回 409 并列出冲突前后航班、要求与"
+        "实际间隔（预约状态与取消时间不变），可行才取消并返回 204、"
+        "立即释放时隙且不移动其他航班；取消的读取、校验与写入和新预约"
+        "共用同一 BEGIN IMMEDIATE 写事务串行化，两个各自可行但合并"
+        "不可行的并发取消至多一个成功；固定计划不可取消，重复取消返回"
+        "204，未知簿或预约返回 404。"
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -1023,22 +1028,53 @@ def book_reservation(
 def cancel_reservation_endpoint(
     book_id: str,
     reservation_id: str,
-    db: sqlite3.Connection = Depends(get_db),
+    db: sqlite3.Connection = Depends(get_booking_db),
 ) -> Response:
-    """取消预约：立即释放所占时隙（后续预约可占用该空档）。
+    """取消预约：仅当取消后剩余计划仍满足冻结约束时才取消（204）。
+
+    按冻结的间隔矩阵、关闭窗口与滚动容量校验**删除目标后**的固定计划与
+    有效预约（仍按 离场时刻、航班号 稳定排序）：不可行返回 409 及冲突
+    明细（冲突前后航班、要求与实际间隔），预约状态与取消时间均不变；
+    可行才取消并立即释放时隙（后续预约可占用该空档），不移动任何其他
+    航班。读取、校验与写入和新预约共用同一 ``BEGIN IMMEDIATE`` 写事务：
+    并发取消被串行化，两个各自可行但合并不可行的取消至多一个成功。
 
     幂等：取消已取消的预约同样返回 204。固定计划中的航班不是预约，
     无法通过本接口取消。预约簿或预约不存在返回 404。
     """
-    if not slot_book_exists(db, book_id):
-        raise HTTPException(status_code=404, detail=f"预约簿不存在: {book_id}")
-    reservation = load_reservation(db, book_id, reservation_id)
-    if reservation is None:
-        raise HTTPException(
-            status_code=404, detail=f"预约不存在: {reservation_id}"
+    try:
+        run_cancel_reservation(db, book_id, reservation_id)
+    except SlotBookNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ReservationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CancelInfeasibleError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "conflicts": [
+                    {
+                        "leader": v.leader_no,
+                        "follower": v.follower_no,
+                        "leader_wake": v.leader_wake,
+                        "follower_wake": v.follower_wake,
+                        "leader_scheduled_off": v.leader_time.isoformat().replace(
+                            "+00:00", "Z"
+                        ),
+                        "follower_scheduled_off": v.follower_time.isoformat().replace(
+                            "+00:00", "Z"
+                        ),
+                        "required_seconds": v.required_seconds,
+                        "actual_seconds": v.actual_seconds,
+                        "shortfall_seconds": v.shortfall_seconds,
+                        "leader_position": v.leader_position,
+                        "follower_position": v.follower_position,
+                    }
+                    for v in exc.violations
+                ],
+            },
         )
-    if reservation.status == "active":
-        cancel_reservation(db, reservation_id)
     return Response(status_code=204)
 
 
